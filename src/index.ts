@@ -1,10 +1,13 @@
+import "dotenv/config";
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { protectedResourceMetadata, requireEntraAuth } from "./auth";
+import { authorizationServerMetadata, proxyAuthorize, proxyToken } from "./oauthProxy";
 
-const PORT = 5150;
+const PORT = Number(process.env.PORT ?? 5150);
 
 function buildServer(): McpServer {
   const server = new McpServer({
@@ -40,13 +43,24 @@ function buildServer(): McpServer {
 }
 
 const app = express();
+app.use((req, _res, next) => {
+  console.log(`${req.method} ${req.originalUrl}`);
+  next();
+});
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 
 app.get("/health", (_req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
-app.post("/mcp", async (req, res) => {
+app.get("/.well-known/oauth-protected-resource", protectedResourceMetadata);
+app.get("/.well-known/oauth-authorization-server", authorizationServerMetadata);
+
+app.get("/authorize", proxyAuthorize);
+app.post("/token", proxyToken);
+
+app.post("/mcp", requireEntraAuth, async (req, res) => {
   try {
     const server = buildServer();
     const transport = new StreamableHTTPServerTransport({
