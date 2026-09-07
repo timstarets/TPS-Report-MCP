@@ -64,6 +64,7 @@ five things `index.ts` currently imports by Entra-specific name:
 ```
 interface IdentityProvider {
   readonly name: "entra" | "okta";
+  readonly supportsDynamicRegistration: boolean;
 
   protectedResourceMetadata(serverBaseUrl: string): ProtectedResourceMetadata;
 
@@ -78,8 +79,38 @@ interface IdentityProvider {
   }>;
 
   verifyAccessToken(bearerToken: string): Promise<{ subject: string; scopes: string[] }>;
+
+  // Present only when supportsDynamicRegistration is true (Okta today).
+  // Relays an RFC 7591 registration request/response, same passthrough
+  // shape as exchangeToken — see §4.7 for why this can't be a thinner
+  // pure-relay operation for Okta specifically.
+  registerClient?(clientRequestBody: unknown): Promise<{
+    status: number;
+    contentType: string;
+    body: string;
+  }>;
 }
 ```
+
+Amended (originator reversed §7's DCR decision — see §4.7 and §7 item 3):
+`supportsDynamicRegistration` plus an optional `registerClient` is the
+originator's suggested shape, and it holds up against the actual code: it's
+the minimum addition that lets `index.ts` register `POST /register`
+*conditionally* — the route exists at all only when the active provider
+sets the flag, so it 404s under Entra rather than existing and erroring.
+`registerClient` is typed identically to `exchangeToken` (status/content-type/body
+passthrough) rather than a parsed RFC 7591 shape, for the same reason
+`exchangeToken` is: the proxy relays, it doesn't need to understand the
+registration response's internals to do its job.
+
+`authorizationServerMetadata` does not gain a new parameter — instead, each
+provider's own implementation is now responsible for including (Okta) or
+omitting (Entra) `registration_endpoint` in the document it returns, exactly
+as it already decides what to include for every other field (§4.1). Okta's
+implementation rewrites `registration_endpoint` to point at this server's
+own `/register`, the same way it already rewrites `authorization_endpoint`
+and `token_endpoint` — one more field added to a rewrite it was already
+doing, not a new mechanism.
 
 - `protectedResourceMetadata` / `authorizationServerMetadata`: produce the
   RFC 9728 / RFC 8414 JSON bodies served at the two `.well-known` routes.
@@ -120,9 +151,11 @@ ENTRA_REQUIRED_SCOPE=access_as_user   # optional, this default preserved
 # required when IDENTITY_PROVIDER=okta
 OKTA_DOMAIN=                # e.g. dev-12345.okta.com — no scheme, no path
 OKTA_AUTH_SERVER_ID=        # custom authorization server ID (see §7, open question)
-OKTA_CLIENT_ID=
 OKTA_AUDIENCE=              # the audience value configured on that auth server
 OKTA_REQUIRED_SCOPE=access_as_user   # optional, same default as Entra for parity
+OKTA_API_TOKEN=             # NEW (§4.7) — admin/management credential, used
+                             # server-side only, to perform Dynamic Client
+                             # Registration on a calling client's behalf
 
 # unchanged, provider-agnostic
 PORT=5150
@@ -139,7 +172,7 @@ checks at module load in both `auth.ts` and `oauthProxy.ts`):
 2. Once the provider is known, check that provider's required variables are
    all present. On any missing, throw naming every missing variable in one
    message: `Configuration error: IDENTITY_PROVIDER=okta requires
-   OKTA_DOMAIN, OKTA_AUTH_SERVER_ID, OKTA_CLIENT_ID, OKTA_AUDIENCE. Missing:
+   OKTA_DOMAIN, OKTA_AUTH_SERVER_ID, OKTA_AUDIENCE, OKTA_API_TOKEN. Missing:
    OKTA_AUDIENCE.` — one error, not one exception per missing var, so a
    misconfigured deploy shows the whole problem at once.
 3. The inactive provider's variables are never required. Setting
@@ -150,10 +183,25 @@ checks at module load in both `auth.ts` and `oauthProxy.ts`):
    prevents `app.listen` from ever being reached) — this spec keeps that
    guarantee, just centralizes where it happens.
 
+**Amended: `OKTA_CLIENT_ID` is no longer part of this list** (it was, in
+the original draft of this spec). Reversing the DCR decision (§7 item 3,
+§4.7) removes the need for it: every client now obtains its own `client_id`
+by calling `POST /register`, rather than the operator hand-configuring one
+fixed value shared across all clients. This is a direct, load-bearing
+consequence of the reversal, not a cosmetic cleanup — the Entra path keeps
+requiring a fixed `ENTRA_CLIENT_ID` precisely because Entra has no
+registration path to get one dynamically (§4.7). `OKTA_API_TOKEN` is what
+replaces it as the credential the Okta path actually depends on — but it
+authenticates the *server* to Okta's Management API, not a specific client
+to the authorization server, which is a different trust relationship than
+the value it's replacing. See §4.7 for why that distinction matters.
+
 ## 4. Divergence between Entra ID and Okta
 
-This is the substance of the design. Six concrete points of divergence,
-each with where it's reconciled.
+This is the substance of the design. Seven concrete points of divergence,
+each with where it's reconciled. (§4.7 was added on amendment, when the
+originator reversed the DCR decision recorded in §7 item 3 — the first six
+were the original draft's full count.)
 
 ### 4.1 Discovery metadata (RFC 8414)
 
@@ -253,6 +301,95 @@ each with where it's reconciled.
 - **This divergence is the one most worth verifying against a real Okta
   tenant before the demo** — see §7.
 
+### 4.7 Dynamic Client Registration (RFC 7591) — client-visible, added on reversal of §7 item 3
+
+Unlike §4.1–4.6, this divergence is not fully absorbed inside the provider
+implementation — it is visible to the calling MCP client, because it shows
+up in the one document every conformant client reads before deciding how to
+authenticate: the RFC 8414 metadata. A DCR-aware client checks for a
+`registration_endpoint` field and changes its behavior depending on whether
+one is present. That's a client-visible branch, not an internal seam.
+
+- **Entra**: no DCR support at any layer. `registration_endpoint` is never
+  present in Entra's self-hosted metadata (unchanged from the original
+  draft). A client falls back to whatever pre-shared `client_id` it's been
+  given out of band — today's behavior, exactly.
+- **Okta**: does expose a `registration_endpoint` — but verified against
+  Okta's own developer documentation, an Okta Developer Community answer,
+  and a documented MCP-ecosystem integration report (sources below), it is
+  **not** anonymous self-service registration the way RFC 7591 and MCP
+  clients generally assume:
+  - The endpoint is `{OKTA_DOMAIN}/oauth2/v1/clients` — an org-level
+    Management API path, not one scoped to whichever custom authorization
+    server the resulting client will actually get tokens from. Per Okta's
+    own developer forum: *"OIDC applications are not registered with custom
+    authorization servers"* — registration and token issuance are separate
+    concerns in Okta's model, whatever RFC 7591 assumes about them being
+    unified in a single authorization server.
+  - Calling it requires an authenticated admin/management credential — not
+    an anonymous POST. A documented MCP-ecosystem GitHub issue against this
+    exact endpoint states it plainly: Okta "requires out-of-band
+    administrator credentials before DCR can proceed," which "defeats the
+    purpose of dynamic registration" as MCP clients expect it.
+  - So `registration_endpoint` being present in Okta's metadata does not by
+    itself mean a client can register itself. A client that discovers the
+    field and POSTs to it with no credentials gets rejected, not registered.
+
+**What "supporting DCR" means here, concretely.** The TPS server's Okta
+provider does not just relay the raw registration request to Okta — doing
+that would hand the client Okta's 401/403 straight back, which is
+discovery-compliant but useless. Instead, the TPS server holds a
+pre-provisioned Okta API token (`OKTA_API_TOKEN`, §3) and performs the real
+`/oauth2/v1/clients` call **on the calling client's behalf**, returning
+Okta's response in the standard RFC 7591 shape. From the MCP client's side,
+`POST /register` against the TPS proxy looks like ordinary anonymous DCR
+succeeding.
+
+**The incompatibility, stated rather than engineered away.** This only
+works because the credential requirement didn't disappear — it moved from
+the client to the TPS server. Okta has no mode where a client registers
+itself with zero pre-existing trust, the way RFC 7591's anonymous case and
+MCP's own assumption both expect. TPS can *simulate* that experience by
+spending its own admin credential on the client's behalf, but that's a
+materially different trust model than "any client can show up and
+register": it's "the operator of this resource server has decided to vouch
+for every registration request it receives," a much broader trust
+extension than it looks like from the client side, and one Entra's
+complete lack of DCR support never even raises as a question. This is the
+real incompatibility the originator's reversal was looking for — not "Okta
+doesn't support DCR" (it does, in a sense), but "Okta's support for DCR
+doesn't mean what a client that only checks for `registration_endpoint`
+would assume it means," and the only way to make it *behave* as if it does
+is for this server to take on a credential it wouldn't otherwise need.
+
+**Conflict this creates elsewhere in the spec, surfaced rather than
+resolved quietly**: the original §2 design assumed both providers use a
+single, statically pre-registered `client_id` known ahead of time (mirroring
+Entra's `proxyAuthorize` check of `clientId !== CLIENT_ID`, `oauthProxy.ts:22-27`
+today). That assumption no longer holds for Okta — different clients can
+now legitimately arrive with different, dynamically-issued `client_id`
+values. `buildAuthorizeRedirectUrl` for Okta must therefore drop that
+static equality check entirely and trust Okta's own `/authorize` to reject
+a `client_id` it never issued. Entra keeps the check, because Entra still
+has exactly one legitimate value to check against. See §3 for the
+resulting removal of `OKTA_CLIENT_ID` as a required variable.
+
+- **Reconciled**: partially inside the Okta provider (the credential-
+  mediated `registerClient` implementation), partially pushed to the
+  operator (§3: a new secret to provision, scoped as narrowly as Okta
+  allows — least-privilege app-management permissions rather than a
+  full super-admin API token, confirmed at implementation time), and
+  partially left as an honest, stated limitation rather than something the
+  design can make disappear (§9, revised acceptance criteria).
+
+Sources consulted: Okta's Dynamic Client Registration API reference
+(developer.okta.com/docs/api/openapi/okta-oauth/oauth/tag/Client), the
+Okta Developer Community thread on dynamic registration with a custom
+authorization server (devforum.okta.com/t/dynamic-client-registration-with-custom-authorization-server/15426),
+and a documented MCP-ecosystem GitHub issue describing this exact
+credential gap against Okta specifically
+(github.com/modelcontextprotocol/modelcontextprotocol/issues/695).
+
 ## 5. Token validation
 
 | | Entra | Okta |
@@ -305,16 +442,31 @@ silently decided:
    Authorization Server doesn't support either). If no Okta org/tenant
    exists yet for this demo, provisioning one with a Custom Authorization
    Server is a prerequisite this spec assumes but doesn't itself deliver.
-3. **DCR deliberately not exposed for Okta.** Okta supports Dynamic Client
-   Registration; this spec does not use it, keeping both providers on a
-   static, pre-registered `CLIENT_ID` (matching Entra, which has no choice).
-   Rationale: exposing DCR would mean the MCP client's registration
-   behavior differs by provider, which risks the live demo needing
-   different connector setup steps per provider — working against the
-   "switch requires no code changes" *and* implicitly no client
-   reconfiguration. This is a judgment call in the direction of demo
-   reliability over showing off Okta's fuller capability; flagging it
-   explicitly in case the originator wants DCR exposed instead.
+3. **Reversed: DCR is now in scope for Okta.** The original draft of this
+   spec deliberately suppressed Okta's DCR support to keep both providers
+   looking identical to the calling client. The originator reviewed that
+   decision and reversed it: the real question this demo exists to answer
+   is whether one MCP server can genuinely support two OAuth providers, or
+   whether the differences are large enough that one must in practice be
+   picked — and suppressing DCR for symmetry hides exactly the
+   client-visible divergence (§4.7) that would answer it. A demo that
+   surfaces a real incompatibility is more useful here than one engineered
+   to look smooth. The goal is no longer "make both providers behave the
+   same" but "support each provider properly and document honestly where
+   that forces the abstraction to leak."
+
+   Support for DCR is added as §4.7, with the interface extended in §2.
+   **Entra still has no DCR support of any kind** — this is an asymmetric
+   capability between the two providers, not a missing implementation on
+   this server's part; nothing changes on the Entra side. What actually
+   researching Okta's DCR turned up (§4.7) is itself a finding worth
+   keeping in the spec rather than smoothing away: Okta's `registration_endpoint`
+   is real, but calling it requires an admin credential this server now has
+   to hold and spend on the client's behalf — DCR "works" for the demo, but
+   not for the reason a client checking only for `registration_endpoint`
+   would assume. That gap is the incompatibility the originator was asking
+   to see surfaced, and §4.7 states it directly rather than absorbing it
+   silently into a "yes, Okta supports DCR" checkbox.
 4. **Okta app registration platform type**: Entra's public/no-secret client
    only works once redirect URIs sit under the "Mobile and desktop
    applications" platform, not "SPA" (AADSTS7000218, per the glossary). The
@@ -378,14 +530,25 @@ Traceable to the intent's "Success criteria":
    regression. *(Intent: "The server runs successfully against Microsoft
    Entra ID.")*
 3. With `IDENTITY_PROVIDER=okta` and required Okta vars set, the server
-   starts and the same flow works against a real Okta org, using the same
-   MCP client configuration (no client-side reconfiguration). *(Intent:
-   "The same codebase runs successfully against Okta, selected by
-   configuration alone.")*
+   starts and the same flow works against a real Okta org. *(Intent: "The
+   same codebase runs successfully against Okta, selected by configuration
+   alone.")* **Revised on DCR reversal**: this criterion no longer implies
+   the calling MCP client needs zero reconfiguration between providers — a
+   DCR-capable client (§4.7) performs a fresh dynamic registration against
+   the Okta path and receives its own `client_id`, rather than reusing
+   whatever `client_id` it used against Entra. That's stated here
+   explicitly rather than left as an unstated assumption the original
+   criterion happened to imply but the intent never actually required —
+   the intent's phrase is about the **codebase** running successfully, which
+   this still satisfies; it says nothing about client-side credential
+   continuity across providers.
 4. Switching between (2) and (3) requires changing only environment
-   variables and restarting the process — verified by a clean `git diff`
-   across the switch. *(Intent: "Switching providers requires no code
-   changes.")*
+   variables and restarting the **server** process — verified by a clean
+   `git diff` across the switch. *(Intent: "Switching providers requires no
+   code changes.")* Unaffected by the DCR reversal: this was always, and
+   remains, a claim about the codebase, not about client-side state. A
+   DCR-capable client re-registering once against the newly-active Okta
+   path is ordinary DCR behavior, not a code change.
 5. Token validation correctly rejects wrong-audience, wrong-issuer,
    insufficient-scope, and invalid-signature tokens under both providers —
    covered by the fixture-based unit tests in §8, including the
@@ -399,3 +562,13 @@ Traceable to the intent's "Success criteria":
    provider switch can be performed and shown end to end during a live
    demonstration.")* This criterion is inherently a live-tenant check
    (§8) and cannot be satisfied by automated tests alone.
+9. **Added on DCR reversal.** A DCR-capable MCP client can `POST /register`
+   against the Okta-backed server with no pre-existing credentials of its
+   own, and receive back a usable `client_id` it can immediately use on
+   `/authorize` — verified against a real Okta org. Against Entra, the same
+   request to `/register` returns 404 (no such route is registered),
+   consistent with Entra having no `registration_endpoint` at all. The
+   credential cost this requires of the server itself (`OKTA_API_TOKEN`,
+   §3, §4.7) is a deliberate, documented design tradeoff — its presence is
+   itself part of what this criterion is checking for, not an
+   implementation detail to hide.
